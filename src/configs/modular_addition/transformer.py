@@ -19,7 +19,7 @@ class TransformerModelConfig:
 class TrainingConfig:
     batch_size: int = 64
     max_epochs: int = 20
-    k_folds: int = 5
+    k_folds: int = 2
     optimizer: frozendict = frozendict({
         "lr": 3e-4,
         "weight_decay": 1e-4

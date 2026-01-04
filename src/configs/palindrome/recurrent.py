@@ -18,7 +18,7 @@ class RecurrentModelConfig:
 class TrainingConfig:
     batch_size: int = 64
     max_epochs: int = 15
-    k_folds: int = 5
+    k_folds: int = 2
     optimizer: frozendict = frozendict({
         "lr": 1e-3,
         "weight_decay": 1e-5

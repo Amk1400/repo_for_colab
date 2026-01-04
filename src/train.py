@@ -32,6 +32,36 @@ class MetricsHistoryCallback(Callback):
         v_acc = trainer.callback_metrics.get("val_acc")
         if v_acc is not None: self.history["val_acc"].append(v_acc.item())
 
+
+# === اضافه‌شده: Callback خیلی سبک برای چاپ Fold / Epoch ===
+class FoldEpochPrintCallback(Callback):
+    def __init__(self, fold_idx: int, total_folds: int):
+        super().__init__()
+        self.fold_idx = fold_idx
+        self.total_folds = total_folds
+
+    def on_train_epoch_start(self, trainer, pl_module):
+        if trainer.sanity_checking:
+            return
+        train_acc = trainer.callback_metrics.get("train_acc")
+        val_acc = trainer.callback_metrics.get("val_acc")
+
+        msg = (
+            f"[Fold {self.fold_idx + 1}/{self.total_folds}] "
+            f"Epoch {trainer.current_epoch + 1}/{trainer.max_epochs}"
+        )
+
+        if train_acc is not None:
+            msg += f" | train_acc={train_acc.item():.4f}"
+        if val_acc is not None:
+            msg += f" | val_acc={val_acc.item():.4f}"
+
+        print(msg, flush=True)
+
+
+# ==========================================================
+
+
 def main():
     parser = argparse.ArgumentParser(description="Deep learning on sequential data")
     
@@ -151,15 +181,15 @@ def main():
             save_top_k=1,
             verbose=False
         )
-
+        fold_epoch_cb = FoldEpochPrintCallback(fold_idx=fold_idx, total_folds=config.train.k_folds)
         # Trainer
         trainer = L.Trainer(
             max_epochs=config.train.max_epochs,
             accelerator="auto",
             devices=1,
-            callbacks=[history_cb, checkpoint_cb],
-            enable_checkpointing=True, 
-            logger=False, 
+            callbacks=[history_cb, checkpoint_cb, fold_epoch_cb],
+            enable_checkpointing=True,
+            logger=False,
             enable_progress_bar=False,
             enable_model_summary=(fold_idx == 0)
         )
