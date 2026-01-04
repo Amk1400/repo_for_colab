@@ -154,7 +154,8 @@ class TransformerEncoderLayer(nn.Module):
 class TransformerEncoder(nn.Module):
     """
     Stack of TransformerEncoderLayer with embedding + positional encoding.
-    Expects vocab_size that does NOT include pad token -> we construct vocab_size+1 embedding.
+    We add an optional subsampling (token downsampling) to reduce sequence length
+    before attention to speed up training while keeping max_len parameter unchanged.
     """
     def __init__(self,
                  vocab_size: int,
@@ -164,39 +165,55 @@ class TransformerEncoder(nn.Module):
                  num_layers: int,
                  pad_token: int,
                  max_len: int,
-                 dropout: float):
+                 dropout: float,
+                 subsample_factor: int = 1):   # <-- new param, default 1 (no subsample)
         super().__init__()
+        assert subsample_factor >= 1 and isinstance(subsample_factor, int)
+        self.subsample_factor = subsample_factor
         self.embed = nn.Embedding(vocab_size + 1, embed_dim, padding_idx=pad_token)
-        self.pos = PositionalEncoding(embed_dim, max_len)
+
+        # create positional encoding for the *post-subsample* length
+        max_len_post = (max_len + subsample_factor - 1) // subsample_factor
+        self.pos = PositionalEncoding(embed_dim, max_len_post)
+
         self.input_dropout = nn.Dropout(dropout) if dropout and dropout > 0.0 else nn.Identity()
         self.layers = nn.ModuleList([TransformerEncoderLayer(embed_dim, num_heads, mlp_dim, dropout)
                                      for _ in range(num_layers)])
         self.pad_token = pad_token
         self.embed_dim = embed_dim
 
-    def make_padding_mask(self, x: torch.Tensor):
-        # x: (B, S)
-        return (x == self.pad_token)  # boolean mask where True => padding
-
     def forward(self, x: torch.Tensor, lengths: torch.Tensor, mask: Optional[torch.Tensor] = None) -> torch.Tensor:
         # x: (B, S)
         B, S = x.size()
         x = self.embed(x)  # (B, S, E)
+
+        # === Subsample tokens if requested ===
+        if self.subsample_factor > 1:
+            # use avg pooling over non-overlapping windows to reduce S by factor
+            # transform to (B, E, S) then pool
+            x_t = x.transpose(1, 2)  # (B, E, S)
+            # pad if necessary so length is divisible by factor
+            pad_len = (self.subsample_factor - (S % self.subsample_factor)) % self.subsample_factor
+            if pad_len:
+                pad_tensor = torch.zeros(B, self.embed_dim, pad_len, device=x_t.device, dtype=x_t.dtype)
+                x_t = torch.cat([x_t, pad_tensor], dim=2)
+            x_pooled = F.avg_pool1d(x_t, kernel_size=self.subsample_factor, stride=self.subsample_factor)  # (B, E, S')
+            x = x_pooled.transpose(1, 2)  # (B, S', E)
+
+            # update lengths accordingly (ceil division)
+            lengths = ((lengths + self.subsample_factor - 1) // self.subsample_factor)
+        else:
+            # no subsampling
+            pass
+
         x = self.pos(x)
         x = self.input_dropout(x)
 
-        # build padding mask (B, S) -> we will pass boolean masks to layers which handle them
-        pad_mask = self.make_padding_mask(x=torch.zeros_like(x[..., 0], dtype=torch.long))  # placeholder to keep type
-        # but better to compute from input tokens; try to recover tokens if available
-        # For safety: expecting embedding padding_idx is set, if tokens unknown, user should pass mask externally.
-        # We'll accept `mask` param as additive mask or boolean masks and forward it to MHA.
-
-        attn_mask = mask  # pass-through; higher-level module constructs appropriate causal mask + padding if needed
-
+        attn_mask = mask  # pass-through (caller may need to adapt mask to post-subsample if used)
         out = x
         for layer in self.layers:
             out = layer(out, mask=attn_mask)
-        return out  # (B, S, E)
+        return out  # (B, S_post, E)
 
 
 class TransformerClassifier(nn.Module):
