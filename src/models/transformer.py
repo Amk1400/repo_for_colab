@@ -10,6 +10,7 @@ import torch.nn.functional as F
 class MultiHeadAttention(nn.Module):
     """
     Manual implementation of multi-head self-attention using nn.Linear primitives.
+    Supports normal self-attention (forward) and cross-attention style usage via forward_qkv.
     Input: (B, S, E)
     Output: (B, S, E)
     """
@@ -38,45 +39,66 @@ class MultiHeadAttention(nn.Module):
 
     def forward(self,
                 x: torch.Tensor,
-                mask: Optional[torch.Tensor] = None) -> torch.Tensor:
-        # x: (B, S, E)
-        B, S, E = x.size()
-        q = self.q_proj(x)  # (B, S, E)
+                mask: Optional[torch.Tensor] = None,
+                return_attn: bool = False) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+        """
+        Standard self-attention where q=k=v=project(x).
+        If return_attn True, returns (out, attn_weights) where attn_weights shape is (B,H,S,S)
+        """
+        q = self.q_proj(x)
         k = self.k_proj(x)
         v = self.v_proj(x)
+        return self._core_attention(q, k, v, mask=mask, return_attn=return_attn)
 
-        qh = self.reshape_for_heads(q)  # (B, H, S, D)
-        kh = self.reshape_for_heads(k)
-        vh = self.reshape_for_heads(v)
+    def forward_qkv(self,
+                    q_src: torch.Tensor,
+                    kv_src: torch.Tensor,
+                    mask: Optional[torch.Tensor] = None,
+                    return_attn: bool = False) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+        """
+        Cross-attention style: q is projected from q_src, k/v from kv_src.
+        q_src: (B, S_q, E)
+        kv_src: (B, S_kv, E)
+        """
+        q = self.q_proj(q_src)
+        k = self.k_proj(kv_src)
+        v = self.v_proj(kv_src)
+        return self._core_attention(q, k, v, mask=mask, return_attn=return_attn)
 
-        # scaled dot-product
-        # attn_scores: (B, H, S, S)
-        attn_scores = torch.matmul(qh, kh.transpose(-2, -1)) / math.sqrt(self.head_dim)
+    def _core_attention(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
+                        mask: Optional[torch.Tensor] = None, return_attn: bool = False):
+        # q,k,v: (B, S, E) already projected
+        B, S_q, E = q.size()
+        S_k = k.size(1)
+        qh = self.reshape_for_heads(q)  # (B, H, S_q, D)
+        kh = self.reshape_for_heads(k)  # (B, H, S_k, D)
+        vh = self.reshape_for_heads(v)  # (B, H, S_k, D)
 
-        # mask handling:
-        # mask can be:
-        #  - causal: (S, S) with -inf above diagonal (float), or
-        #  - boolean padding mask of shape (B, S) that marks paddings True, or
-        #  - combined: (B, S, S)
+        attn_scores = torch.matmul(qh, kh.transpose(-2, -1)) / math.sqrt(self.head_dim)  # (B,H,S_q,S_k)
+
         if mask is not None:
             if mask.dtype == torch.bool:
-                # mask True means masked out. Expand to (B,1,1,S) or (B,1,S,S)
+                # mask True -> masked out
                 if mask.dim() == 2:
-                    # (B,S) padding mask -> we want to mask key positions
-                    key_mask = mask.unsqueeze(1).unsqueeze(2)  # (B,1,1,S)
+                    # (B, S_k) padding mask -> mask key positions
+                    key_mask = mask.unsqueeze(1).unsqueeze(2)  # (B,1,1,S_k)
                     attn_scores = attn_scores.masked_fill(key_mask, float('-inf'))
                 elif mask.dim() == 3:
-                    # (B,S,S)
+                    # (B, S_q, S_k)
                     attn_scores = attn_scores.masked_fill(mask.unsqueeze(1), float('-inf'))
             else:
-                # assume mask is additive float mask (S, S) or (B, S, S); add directly
-                attn_scores = attn_scores + mask.unsqueeze(0) if mask.dim() == 2 else attn_scores + mask.unsqueeze(1)
+                # additive float mask
+                if mask.dim() == 2:
+                    attn_scores = attn_scores + mask.unsqueeze(0)
+                else:
+                    attn_scores = attn_scores + mask.unsqueeze(1)
 
-        attn_weights = torch.softmax(attn_scores, dim=-1)  # (B, H, S, S)
-        attn_out = torch.matmul(attn_weights, vh)  # (B, H, S, D)
-        # combine heads
-        attn_out = attn_out.transpose(1, 2).contiguous().view(B, S, E)
+        attn_weights = torch.softmax(attn_scores, dim=-1)  # (B,H,S_q,S_k)
+        attn_out = torch.matmul(attn_weights, vh)  # (B,H,S_q,D)
+        attn_out = attn_out.transpose(1, 2).contiguous().view(B, S_q, E)  # (B,S_q,E)
         out = self.out_proj(attn_out)
+        if return_attn:
+            return out, attn_weights
         return out
 
 
@@ -101,6 +123,7 @@ class MLP(nn.Module):
 class PositionalEncoding(nn.Module):
     """
     Fixed sinusoidal positional encodings (non-learnable) -> better extrapolation.
+    Stores full pe buffer for max_len and allows indexing.
     """
     def __init__(self, embed_dim: int, max_len: int):
         super().__init__()
@@ -109,7 +132,6 @@ class PositionalEncoding(nn.Module):
         div_term = torch.exp(torch.arange(0, embed_dim, 2).float() * (-math.log(10000.0) / embed_dim))
         pe[:, 0::2] = torch.sin(position * div_term)
         if embed_dim % 2 == 1:
-            # last odd dimension
             pe[:, 1::2] = torch.cos(position * div_term[:-1])
         else:
             pe[:, 1::2] = torch.cos(position * div_term)
@@ -154,8 +176,12 @@ class TransformerEncoderLayer(nn.Module):
 class TransformerEncoder(nn.Module):
     """
     Stack of TransformerEncoderLayer with embedding + positional encoding.
-    We add an optional subsampling (token downsampling) to reduce sequence length
-    before attention to speed up training while keeping max_len parameter unchanged.
+    Auto-computes a subsample factor at runtime (no external config change).
+    Enhancements:
+      - gated symmetry channel (rich features from x and reversed x)
+      - multi-scale pooling (two scales: factor and factor_small)
+      - concat forward+reverse + concat_proj preserved
+      - mirror (cross-) attention applied on pooled sequence to explicitly attend mirrored positions
     """
     def __init__(self,
                  vocab_size: int,
@@ -165,55 +191,169 @@ class TransformerEncoder(nn.Module):
                  num_layers: int,
                  pad_token: int,
                  max_len: int,
-                 dropout: float,
-                 subsample_factor: int = 1):   # <-- new param, default 1 (no subsample)
+                 dropout: float):
         super().__init__()
-        assert subsample_factor >= 1 and isinstance(subsample_factor, int)
-        self.subsample_factor = subsample_factor
         self.embed = nn.Embedding(vocab_size + 1, embed_dim, padding_idx=pad_token)
-
-        # create positional encoding for the *post-subsample* length
-        max_len_post = (max_len + subsample_factor - 1) // subsample_factor
-        self.pos = PositionalEncoding(embed_dim, max_len_post)
-
+        # store original max_len and create full positional encodings
+        self.max_len = max_len
+        self.pos = PositionalEncoding(embed_dim, max_len)
         self.input_dropout = nn.Dropout(dropout) if dropout and dropout > 0.0 else nn.Identity()
         self.layers = nn.ModuleList([TransformerEncoderLayer(embed_dim, num_heads, mlp_dim, dropout)
                                      for _ in range(num_layers)])
         self.pad_token = pad_token
         self.embed_dim = embed_dim
+        self.num_heads = num_heads
+
+        # gated symmetry projection: concat [x, rev, x*rev, |x-rev|] -> small MLP -> gated add
+        self.sym_mlp = nn.Linear(embed_dim * 4, embed_dim)
+        nn.init.xavier_uniform_(self.sym_mlp.weight)
+        self.sym_gate = nn.Linear(embed_dim, embed_dim)
+        nn.init.xavier_uniform_(self.sym_gate.weight)
+
+        # projection after concat(forward,reverse) -> embed_dim
+        self.concat_proj = nn.Linear(embed_dim * 2, embed_dim)
+        nn.init.xavier_uniform_(self.concat_proj.weight)
+
+        # small learnable projection applied to pooled features (acts like pointwise conv after pooling)
+        self.pool_proj = nn.Linear(embed_dim, embed_dim)
+        nn.init.xavier_uniform_(self.pool_proj.weight)
+
+        # mirror attention module (cross-attn q from forward, kv from reverse)
+        self.mirror_attn = MultiHeadAttention(embed_dim=embed_dim, num_heads=num_heads)
+
+        # last used subsample factor (defaults to 1)
+        self.last_subsample_factor = 1
+
+    def _compute_subsample_factor(self, seq_len: int, target_post_len: int = 80) -> int:
+        """
+        Compute an integer subsample factor to aim roughly for target_post_len.
+        Ensures factor >=1.
+        """
+        if seq_len <= target_post_len:
+            return 1
+        # ceil division
+        factor = (seq_len + target_post_len - 1) // target_post_len
+        return int(max(1, factor))
+
+    def _multi_scale_factors(self, factor: int) -> Tuple[int, int]:
+        """
+        return (factor, factor_small) where factor_small is a smaller pooling factor (>=1)
+        """
+        if factor <= 1:
+            return 1, 1
+        factor_small = max(1, factor // 2)
+        return factor, factor_small
 
     def forward(self, x: torch.Tensor, lengths: torch.Tensor, mask: Optional[torch.Tensor] = None) -> torch.Tensor:
         # x: (B, S)
         B, S = x.size()
-        x = self.embed(x)  # (B, S, E)
+        device = x.device
 
-        # === Subsample tokens if requested ===
-        if self.subsample_factor > 1:
-            # use avg pooling over non-overlapping windows to reduce S by factor
-            # transform to (B, E, S) then pool
-            x_t = x.transpose(1, 2)  # (B, E, S)
-            # pad if necessary so length is divisible by factor
-            pad_len = (self.subsample_factor - (S % self.subsample_factor)) % self.subsample_factor
+        # Embedding
+        x_emb = self.embed(x)  # (B, S, E)
+
+        # --- Gated Symmetry channel: form rich features from forward and reversed embeddings ---
+        x_rev_emb = x_emb.flip(dims=[1])  # (B, S, E)
+        diff = torch.abs(x_emb - x_rev_emb)  # (B,S,E)
+        prod = x_emb * x_rev_emb  # (B,S,E)
+        # concat features
+        sym_in = torch.cat([x_emb, x_rev_emb, prod, diff], dim=-1)  # (B,S,4E)
+        sym_mapped = self.sym_mlp(sym_in)  # (B,S,E)
+        gate = torch.sigmoid(self.sym_gate(sym_mapped))  # (B,S,E)
+        # gated fusion
+        x_emb = x_emb + gate * sym_mapped
+
+        # decide subsample factor dynamically based on S and target
+        factor = self._compute_subsample_factor(S, target_post_len=80)
+        self.last_subsample_factor = factor
+        factor, factor_small = self._multi_scale_factors(factor)
+
+        if factor > 1:
+            # ===== multi-scale pooling =====
+            # forward pooled (large factor)
+            x_t = x_emb.transpose(1, 2)  # (B, E, S)
+            pad_len = (factor - (S % factor)) % factor
             if pad_len:
-                pad_tensor = torch.zeros(B, self.embed_dim, pad_len, device=x_t.device, dtype=x_t.dtype)
+                pad_tensor = torch.zeros(B, self.embed_dim, pad_len, device=device, dtype=x_t.dtype)
                 x_t = torch.cat([x_t, pad_tensor], dim=2)
-            x_pooled = F.avg_pool1d(x_t, kernel_size=self.subsample_factor, stride=self.subsample_factor)  # (B, E, S')
-            x = x_pooled.transpose(1, 2)  # (B, S', E)
+            x_pooled = F.avg_pool1d(x_t, kernel_size=factor, stride=factor)  # (B, E, S_post)
+            x_fwd = x_pooled.transpose(1, 2)  # (B, S_post, E)
+            x_fwd = self.pool_proj(x_fwd)
 
-            # update lengths accordingly (ceil division)
-            lengths = ((lengths + self.subsample_factor - 1) // self.subsample_factor)
+            # forward pooled (small factor) -- only if different
+            if factor_small != factor:
+                pad_len_small = (factor_small - (S % factor_small)) % factor_small
+                x_t_small = x_emb.transpose(1, 2)
+                if pad_len_small:
+                    pad_tensor_s = torch.zeros(B, self.embed_dim, pad_len_small, device=device, dtype=x_t_small.dtype)
+                    x_t_small = torch.cat([x_t_small, pad_tensor_s], dim=2)
+                x_pooled_small = F.avg_pool1d(x_t_small, kernel_size=factor_small, stride=factor_small)
+                x_fwd_small = x_pooled_small.transpose(1, 2)  # (B, S_post_small, E)
+                x_fwd_small = self.pool_proj(x_fwd_small)
+            else:
+                x_fwd_small = None
+
+            # reversed pooled (mirrored windows) for large factor
+            x_rev_emb2 = x_emb.flip(dims=[1])  # (B, S, E)
+            x_rt = x_rev_emb2.transpose(1, 2)
+            if pad_len:
+                pad_tensor_r = torch.zeros(B, self.embed_dim, pad_len, device=device, dtype=x_rt.dtype)
+                x_rt = torch.cat([x_rt, pad_tensor_r], dim=2)
+            x_r_pooled = F.avg_pool1d(x_rt, kernel_size=factor, stride=factor)  # (B, E, S_post)
+            x_rev = x_r_pooled.transpose(1, 2)  # (B, S_post, E)
+            x_rev = self.pool_proj(x_rev)
+
+            # concat forward and reverse pooled features (per position)
+            x_cat = torch.cat([x_fwd, x_rev], dim=-1)  # (B, S_post, 2E)
+            # project back to embed_dim
+            x = self.concat_proj(x_cat)  # (B, S_post, E)
+
+            # positions for pos encoding sampling
+            S_post = x.size(1)
+            positions = torch.arange(0, S, step=factor, device=device)[:S_post].long()  # (S_post,)
+            max_pos = min(self.max_len - 1, S - 1)
+            positions = positions.clamp(0, max_pos)
+            pe = self.pos.pe.to(device)  # (max_len, E)
+            pos_pe = pe[positions]  # (S_post, E)
+            x = x + pos_pe.unsqueeze(0)
+
+            # If multi-scale small exists, upsample/align small features and fuse (simple approach: project & sum)
+            if x_fwd_small is not None:
+                # we need to bring x_fwd_small to length S_post
+                # simplest: average pool/upsample small->S_post by taking every (factor//factor_small)-th or interpolate
+                # we'll use simple interpolation (linear) along sequence
+                # x_fwd_small: (B, S_post_small, E)
+                x_small = F.interpolate(x_fwd_small.transpose(1, 2), size=S_post, mode='linear', align_corners=False).transpose(1, 2)
+                # fuse (sum) and re-project to stabilize (use concat_proj)
+                x = x + 0.5 * x_small  # light fusion
+
+            # update lengths (ceil div)
+            new_lengths = ((lengths + factor - 1) // factor).to(lengths.device)
+            lengths = new_lengths
         else:
-            # no subsampling
-            pass
+            # no subsample: add standard first-S positional encodings on enriched embedding
+            x = self.pos(x_emb)
+            # lengths unchanged
 
-        x = self.pos(x)
         x = self.input_dropout(x)
 
-        attn_mask = mask  # pass-through (caller may need to adapt mask to post-subsample if used)
+        # ===== Mirror (cross-) attention: q from x, kv from reversed x =====
+        # This explicitly provides direct i <-> mirrored(i) pathway
+        # Build reversed sequence of x (post-pool)
+        if getattr(self, "mirror_attn", None) is not None:
+            x_rev_post = x.flip(dims=[1])  # (B, S_post, E)
+            # cross-attend: q from x, kv from x_rev_post
+            mirror_out = self.mirror_attn.forward_qkv(q_src=x, kv_src=x_rev_post, mask=None)
+            # fuse mirror_out (residual-style). use a moderate scalar to not overwhelm self-attention path
+            x = x + 0.7 * mirror_out
+
         out = x
         for layer in self.layers:
-            out = layer(out, mask=attn_mask)
-        return out  # (B, S_post, E)
+            out = layer(out, mask=mask)
+
+        # store last factor
+        self.last_subsample_factor = factor
+        return out
 
 
 class TransformerClassifier(nn.Module):
@@ -252,16 +392,22 @@ class TransformerClassifier(nn.Module):
         mask: optional mask (causal additive mask or boolean masks)
         returns: logits (B, num_classes)
         """
-        enc = self.encoder(x, lengths, mask=mask)  # (B, S, E)
+        enc = self.encoder(x, lengths, mask=mask)  # (B, S_post, E)
         enc = self.final_ln(enc)
 
-        # masked mean pooling
-        B, S, E = enc.size()
+        B, S_post, E = enc.size()
         device = enc.device
-        # Build padding mask from lengths
-        seq_range = torch.arange(0, S, device=device).unsqueeze(0).expand(B, S)
-        mask_pad = seq_range >= lengths.unsqueeze(1)  # True at padded positions
-        valid = (~mask_pad).unsqueeze(-1)  # (B, S, 1)
+
+        # compute post-subsample lengths using last_subsample_factor stored in encoder
+        factor = getattr(self.encoder, "last_subsample_factor", 1)
+        if factor > 1:
+            new_lengths = ((lengths + factor - 1) // factor).to(lengths.device)
+        else:
+            new_lengths = lengths.to(lengths.device)
+
+        seq_range = torch.arange(0, S_post, device=device).unsqueeze(0).expand(B, S_post)
+        mask_pad = seq_range >= new_lengths.unsqueeze(1)  # True at padded positions
+        valid = (~mask_pad).unsqueeze(-1)  # (B, S_post, 1)
         enc_masked = enc * valid.to(enc.dtype)
         denom = valid.sum(dim=1).clamp(min=1).to(enc.dtype)  # (B, 1)
         pooled = enc_masked.sum(dim=1) / denom  # (B, E)
