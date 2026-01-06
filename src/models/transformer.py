@@ -179,7 +179,7 @@ class TransformerEncoder(nn.Module):
         self.num_heads = num_heads
 
         # gated symmetry projection
-        self.sym_mlp = nn.Linear(embed_dim * 4, embed_dim)
+        self.sym_mlp = nn.Linear(embed_dim * 3, embed_dim)
         nn.init.xavier_uniform_(self.sym_mlp.weight)
         self.sym_gate = nn.Linear(embed_dim, embed_dim)
         nn.init.xavier_uniform_(self.sym_gate.weight)
@@ -220,8 +220,7 @@ class TransformerEncoder(nn.Module):
         # gated symmetry
         x_rev_emb = x_emb.flip(dims=[1])
         diff = torch.abs(x_emb - x_rev_emb)
-        prod = x_emb * x_rev_emb
-        sym_in = torch.cat([x_emb, x_rev_emb, prod, diff], dim=-1)
+        sym_in = torch.cat([x_emb, x_rev_emb, diff], dim=-1)
         sym_mapped = self.sym_mlp(sym_in)
         gate = torch.sigmoid(self.sym_gate(sym_mapped))
         x_emb = x_emb + gate * sym_mapped
